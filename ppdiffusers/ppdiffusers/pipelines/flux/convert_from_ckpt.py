@@ -802,7 +802,86 @@ def convert_flux_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
 
     return converted_state_dict
 
+def convert_open_clip_checkpoint(
+    checkpoint,
+    config_name,
+    prefix="cond_stage_model.model.",
+    has_projection=False,
+    local_files_only=False,
+    **config_kwargs,
+):
+    # text_model = CLIPTextModel.from_pretrained("stabilityai/stable-diffusion-2", subfolder="text_encoder")
+    # text_model = CLIPTextModelWithProjection.from_pretrained(
+    #    "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k", projection_dim=1280
+    # )
+    try:
+        config = CLIPTextConfig.from_pretrained(config_name, **config_kwargs, local_files_only=local_files_only)
+    except Exception:
+        raise ValueError(
+            f"With local_files_only set to {local_files_only}, you must first locally save the configuration in the following path: '{config_name}'."
+        )
 
+    init_contexts = []
+    init_contexts.append(paddle.dtype_guard(paddle.float32))
+    init_contexts.append(no_init_weights(_enable=True))
+    if hasattr(paddle, "LazyGuard"):
+        init_contexts.append(paddle.LazyGuard())
+    with ContextManagers(init_contexts):
+        text_model = CLIPTextModelWithProjection(config) if has_projection else CLIPTextModel(config)
+
+    keys = list(checkpoint.keys())
+
+    keys_to_ignore = []
+    if config_name == "stabilityai/stable-diffusion-2" and config.num_hidden_layers == 23:
+        # make sure to remove all keys > 22
+        keys_to_ignore += [k for k in keys if k.startswith("cond_stage_model.model.transformer.resblocks.23")]
+        keys_to_ignore += ["cond_stage_model.model.text_projection"]
+
+    text_model_dict = {}
+
+    if prefix + "text_projection" in checkpoint:
+        d_model = int(checkpoint[prefix + "text_projection"].shape[0])
+    else:
+        d_model = 1024
+
+    # text_model_dict["text_model.embeddings.position_embedding.weight"] = text_model.text_model.embeddings.get_buffer("position_ids")
+
+    for key in keys:
+        if key in keys_to_ignore:
+            continue
+
+        if key[len(prefix) :] in textenc_conversion_map:
+            if key.endswith("text_projection"):
+                value = checkpoint[key].T
+            else:
+                value = checkpoint[key]
+
+            text_model_dict[textenc_conversion_map[key[len(prefix) :]]] = value
+
+        if key.startswith(prefix + "transformer."):
+            new_key = key[len(prefix + "transformer.") :]
+            if new_key.endswith(".in_proj_weight"):
+                new_key = new_key[: -len(".in_proj_weight")]
+                new_key = textenc_pattern.sub(lambda m: protected[re.escape(m.group(0))], new_key)
+                text_model_dict[new_key + ".q_proj.weight"] = checkpoint[key][:d_model, :]
+                text_model_dict[new_key + ".k_proj.weight"] = checkpoint[key][d_model : d_model * 2, :]
+                text_model_dict[new_key + ".v_proj.weight"] = checkpoint[key][d_model * 2 :, :]
+            elif new_key.endswith(".in_proj_bias"):
+                new_key = new_key[: -len(".in_proj_bias")]
+                new_key = textenc_pattern.sub(lambda m: protected[re.escape(m.group(0))], new_key)
+                text_model_dict[new_key + ".q_proj.bias"] = checkpoint[key][:d_model]
+                text_model_dict[new_key + ".k_proj.bias"] = checkpoint[key][d_model : d_model * 2]
+                text_model_dict[new_key + ".v_proj.bias"] = checkpoint[key][d_model * 2 :]
+            else:
+                new_key = textenc_pattern.sub(lambda m: protected[re.escape(m.group(0))], new_key)
+
+                text_model_dict[new_key] = checkpoint[key]
+
+    if not (hasattr(text_model, "embeddings") and hasattr(text_model.embeddings.position_ids)):
+        text_model_dict.pop("text_model.embeddings.position_ids", None)
+    faster_set_state_dict(text_model, convert_diffusers_vae_unet_to_ppdiffusers(text_model, text_model_dict))
+
+    return text_model
 def get_default(params, key, default):
     if key in params:
         return params[key]
@@ -1193,7 +1272,7 @@ def convert_ldm_clip_checkpoint(checkpoint, local_files_only=False, text_encoder
 
     text_model_dict = {}
 
-    remove_prefixes = ["cond_stage_model.transformer", "conditioner.embedders.0.transformer"]
+    remove_prefixes = ["cond_stage_model.transformer", "conditioner.embedders.0.transformer","text_encoders.clip_l.transformer"]
 
     for key in keys:
         for prefix in remove_prefixes:
@@ -1206,12 +1285,12 @@ def convert_ldm_clip_checkpoint(checkpoint, local_files_only=False, text_encoder
     faster_set_state_dict(text_model, convert_diffusers_vae_unet_to_ppdiffusers(text_model, text_model_dict))
 
     return text_model
-def convert_sd3_t5_checkpoint_to_diffusers(checkpoint):
-    keys = list(checkpoint.keys())
+def convert_sd3_t5_checkpoint_to_diffusers(checkpoint):  
+    keys = list(checkpoint.keys()) 
     text_model_dict = {}
 
     remove_prefixes = ["text_encoders.t5xxl.transformer."]
-
+    
     for key in keys:
         for prefix in remove_prefixes:
             if key.startswith(prefix):
@@ -1799,6 +1878,11 @@ def download_from_original_flux_ckpt(
                     f"With local_files_only set to {local_files_only}, you must first locally save the tokenizer in the following path: 'openai/clip-vit-large-patch14'."
                 )
             text_encoder = convert_ldm_clip_checkpoint(checkpoint, local_files_only=local_files_only)
+           
+            
+
+           
+
             # try:
             tokenizer_2 = T5Tokenizer.from_pretrained(
                 "google/t5-v1_1-xxl", local_files_only=local_files_only
@@ -1817,14 +1901,8 @@ def download_from_original_flux_ckpt(
                 config=None,
                 torch_dtype=None,
                 local_files_only=local_files_only,
-
-                # # checkpoint,
-                # # config_name,
-                # # # prefix="conditioner.embedders.1.model.",
-                # # has_projection=True,
-                # # local_files_only=local_files_only,
-                # **config_kwargs,
             )
+            #text_encoder_2 = T5EncoderModel.from_pretrained("black-forest-labs/FLUX.1-dev",subfolder="text_encoder_2" , paddle_dtype="float32" )
 
             
             pipe = pipeline_class(
